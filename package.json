@@ -1,6 +1,7 @@
 {
   "name": "syncpad",
   "private": true,
+  "packageManager": "pnpm@9.15.4",
   "version": "0.0.1",
   "scripts": {
     "dev": "concurrently \"pnpm -F @syncpad/server dev\" \"pnpm -F @syncpad/client dev\"",
@@ -9,5 +10,11 @@
   },
   "devDependencies": {
     "concurrently": "^10.0.5"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "es5-ext",
+      "esbuild"
+    ]
   }
 }
