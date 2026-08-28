@@ -47,43 +47,6 @@ async function main() {
     ...(hostOverride ? { host: hostOverride } : {})
   })
   
-  // Auto-migrate on startup for Cloud Run
-  console.log('Ensuring database schema exists...')
-  await sql`
-    CREATE TABLE IF NOT EXISTS documents (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL DEFAULT 'Untitled',
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
-    );
-  `
-  await sql`
-    CREATE TABLE IF NOT EXISTS operations (
-      id SERIAL PRIMARY KEY,
-      doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-      agent_id TEXT NOT NULL,
-      seq INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      pos INTEGER NOT NULL,
-      content TEXT,
-      parent_ids JSONB NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-      UNIQUE (agent_id, seq)
-    );
-  `
-  await sql`
-    CREATE TABLE IF NOT EXISTS critical_versions (
-      id SERIAL PRIMARY KEY,
-      doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-      agent_id TEXT NOT NULL,
-      seq INTEGER NOT NULL,
-      snapshot TEXT NOT NULL,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
-      UNIQUE (agent_id, seq)
-    );
-  `
-  console.log('Database schema ready.')
-
   const db: DB = drizzle(sql, { schema })
 
   // ── Fastify ─────────────────────────────────────────────────────────────────
@@ -133,6 +96,43 @@ async function main() {
   // ── Start ────────────────────────────────────────────────────────────────────
   await app.listen({ port: PORT, host: HOST })
   console.log(`SyncPad server listening on http://${HOST}:${PORT}`)
+  
+  // Auto-migrate on startup for Cloud Run AFTER listening to pass TCP probes
+  console.log('Ensuring database schema exists...')
+  await sql`
+    CREATE TABLE IF NOT EXISTS documents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT 'Untitled',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL
+    );
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS operations (
+      id SERIAL PRIMARY KEY,
+      doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      agent_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      pos INTEGER NOT NULL,
+      content TEXT,
+      parent_ids JSONB NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+      UNIQUE (agent_id, seq)
+    );
+  `
+  await sql`
+    CREATE TABLE IF NOT EXISTS critical_versions (
+      id SERIAL PRIMARY KEY,
+      doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      agent_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      snapshot TEXT NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+      UNIQUE (agent_id, seq)
+    );
+  `
+  console.log('Database schema ready.')
 }
 
 main().catch(err => {
