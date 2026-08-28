@@ -30,7 +30,22 @@ async function main() {
   const connectionString = process.env.DATABASE_URL
   if (!connectionString) throw new Error('DATABASE_URL is not set')
 
-  const sql = postgres(connectionString, { max: 10 })
+  // Support Cloud SQL unix sockets via ?host=/cloudsql/... in the URL
+  let hostOverride: string | undefined = undefined
+  try {
+    const url = new URL(connectionString)
+    if (url.searchParams.has('host')) {
+      hostOverride = url.searchParams.get('host') || undefined
+    }
+  } catch (e) {
+    // Ignore URL parse errors, let postgres.js handle it
+  }
+
+  const sql = postgres(connectionString, {
+    max: 10,
+    connect_timeout: 10,
+    ...(hostOverride ? { host: hostOverride } : {})
+  })
   
   // Auto-migrate on startup for Cloud Run
   console.log('Ensuring database schema exists...')

@@ -79,6 +79,7 @@ let globalSql: any = null
 function publishEvent(docId: string, payload: any) {
   if (globalSql) {
     globalSql.notify('syncpad_events', JSON.stringify({ ...payload, instanceId: INSTANCE_ID, docId }))
+      .catch((err: any) => console.error('[ws] sql.notify failed:', err))
   }
 }
 
@@ -132,6 +133,8 @@ export function registerWsHandler(app: FastifyInstance, db: DB, sql: any): void 
       } catch (e) {
         console.error('Error handling pubsub message:', e)
       }
+    }).catch((err: any) => {
+      console.error('[ws] sql.listen failed to start:', err)
     })
     
     // Periodically prune ghost peers that stopped sending pings (e.g. from crashed instances or dropped TCP connections)
