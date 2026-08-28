@@ -69,7 +69,109 @@ function parseMessage(raw: string): ClientMessage | null {
 
 // ─── Handler registration ─────────────────────────────────────────────────────
 
-export function registerWsHandler(app: FastifyInstance, db: DB): void {
+import { v4 as uuid } from 'uuid'
+import { getLocalPeersInfo } from '../sessions/sessionStore.js'
+
+const INSTANCE_ID = uuid()
+let isListening = false
+let globalSql: any = null
+
+function publishEvent(docId: string, payload: any) {
+  if (globalSql) {
+    globalSql.notify('syncpad_events', JSON.stringify({ ...payload, instanceId: INSTANCE_ID, docId }))
+  }
+}
+
+export function registerWsHandler(app: FastifyInstance, db: DB, sql: any): void {
+  globalSql = sql
+  if (!isListening && sql) {
+    isListening = true
+    sql.listen('syncpad_events', (rawPayload: string) => {
+      try {
+        const payload = JSON.parse(rawPayload)
+        if (payload.instanceId === INSTANCE_ID) return // Ignore own events
+
+        const session = app.sessions?.get(payload.docId)
+        if (!session) return
+
+        if (payload.type === 'sync_peers') {
+          const isNewInstance = !session.remotePeers.has(payload.instanceId)
+          const now = Date.now()
+          payload.peers.forEach((p: any) => p.lastSeen = now)
+          session.remotePeers.set(payload.instanceId, payload.peers)
+          // Broadcast merged peer list to local peers
+          broadcast(
+            session,
+            JSON.stringify({ type: 'peers', docId: payload.docId, peers: getPeersInfo(session) })
+          )
+          
+          // Let the new instance know about our local peers
+          if (isNewInstance && session.peers.size > 0) {
+            publishEvent(payload.docId, { type: 'sync_peers', peers: getLocalPeersInfo(session) })
+          }
+        } else if (payload.type === 'broadcast') {
+          try {
+            const parsedMsg = JSON.parse(payload.message)
+            if (parsedMsg.type === 'ops' && parsedMsg.ops) {
+              // Apply remote ops to server memory without persisting (since sender already persisted)
+              applyRemoteOps(db, session, parsedMsg.ops, false).catch(console.error)
+            } else if (parsedMsg.type === 'cursor') {
+              // Update lastSeen for remote peers
+              const peersForInstance = session.remotePeers.get(payload.instanceId)
+              if (peersForInstance) {
+                const peer = peersForInstance.find(p => p.agentId === parsedMsg.agentId)
+                if (peer) peer.lastSeen = Date.now()
+              }
+            }
+          } catch (e) {
+            console.error('Failed to parse broadcast message for ops application', e)
+          }
+          // Relay the message to all local peers
+          broadcast(session, payload.message, payload.excludeAgentId)
+        }
+      } catch (e) {
+        console.error('Error handling pubsub message:', e)
+      }
+    })
+    
+    // Periodically prune ghost peers that stopped sending pings (e.g. from crashed instances or dropped TCP connections)
+    setInterval(() => {
+      if (!app.sessions) return
+      const now = Date.now()
+      for (const session of app.sessions.values()) {
+        let changed = false
+        
+        // Prune remote ghosts
+        for (const [instanceId, peers] of session.remotePeers.entries()) {
+          const activePeers = peers.filter(p => !p.lastSeen || (now - p.lastSeen < 15000))
+          if (activePeers.length !== peers.length) {
+            if (activePeers.length === 0) {
+              session.remotePeers.delete(instanceId)
+            } else {
+              session.remotePeers.set(instanceId, activePeers)
+            }
+            changed = true
+          }
+        }
+        
+        if (changed) {
+          broadcast(
+            session,
+            JSON.stringify({ type: 'peers', docId: session.docId, peers: getPeersInfo(session) })
+          )
+        }
+        
+        // Prune local ghosts (silently dropped TCP connections)
+        for (const [agentId, peer] of session.peers.entries()) {
+          if (peer.lastSeen && now - peer.lastSeen > 15000) {
+            console.log(`[ws] Pruning ghost local peer ${agentId}`)
+            peer.ws.close() // This triggers the 'close' event handler to clean up and broadcast
+          }
+        }
+      }
+    }, 5000)
+  }
+
   app.get(
     '/ws',
     { websocket: true },
@@ -146,6 +248,7 @@ export function registerWsHandler(app: FastifyInstance, db: DB): void {
                 peers: getPeersInfo(session),
               } satisfies ServerMessage),
             )
+            publishEvent(currentDocId, { type: 'sync_peers', peers: getLocalPeersInfo(session) })
           }
         }
       })
@@ -201,19 +304,9 @@ async function handleJoin(
     return
   }
 
-  const peer: ConnectedPeer = { ws: socket, agentId, userId, name, picture, color }
+  const peer: ConnectedPeer = { ws: socket, agentId, userId, name, picture, color, lastSeen: Date.now() }
 
-  // Dedup by userId: if this Google user already has a live connection, close it.
-  if (userId) {
-    for (const [existingAgentId, existingPeer] of session.peers) {
-      if (existingPeer.userId === userId) {
-        console.log(`[ws] Replacing old connection for userId=${userId} (agentId=${existingAgentId})`)
-        existingPeer.ws.close()
-        session.peers.delete(existingAgentId)
-        break
-      }
-    }
-  }
+
 
   addPeer(session, peer)
   onJoined(docId, agentId)
@@ -239,6 +332,7 @@ async function handleJoin(
     JSON.stringify({ type: 'peers', docId, peers: getPeersInfo(session) } satisfies ServerMessage),
     agentId,
   )
+  publishEvent(docId, { type: 'sync_peers', peers: getLocalPeersInfo(session) })
 }
 
 async function handleOps(
@@ -262,16 +356,14 @@ async function handleOps(
 
   // Broadcast to all other clients.
   if (newOps.length > 0) {
-    broadcast(
-      session,
-      JSON.stringify({
-        type: 'ops',
-        docId,
-        ops: newOps,
-        fromAgent: senderAgentId,
-      } satisfies ServerMessage),
-      senderAgentId,
-    )
+    const opsMsg = JSON.stringify({
+      type: 'ops',
+      docId,
+      ops: newOps,
+      fromAgent: senderAgentId,
+    } satisfies ServerMessage)
+    broadcast(session, opsMsg, senderAgentId)
+    publishEvent(docId, { type: 'broadcast', message: opsMsg, excludeAgentId: senderAgentId })
   }
 }
 
@@ -287,19 +379,18 @@ function handlePing(
   if (peer) {
     peer.cursor = msg.cursor
     peer.name = msg.name
+    peer.lastSeen = Date.now()
     if (msg.picture) peer.picture = msg.picture
   }
 
-  broadcast(
-    session,
-    JSON.stringify({
-      type: 'cursor',
-      docId,
-      agentId,
-      cursor: msg.cursor,
-      name: msg.name,
-      picture: msg.picture,
-    } satisfies ServerMessage),
+  const cursorMsg = JSON.stringify({
+    type: 'cursor',
+    docId,
     agentId,
-  )
+    cursor: msg.cursor,
+    name: msg.name,
+    picture: msg.picture,
+  } satisfies ServerMessage)
+  broadcast(session, cursorMsg, agentId)
+  publishEvent(docId, { type: 'broadcast', message: cursorMsg, excludeAgentId: agentId })
 }

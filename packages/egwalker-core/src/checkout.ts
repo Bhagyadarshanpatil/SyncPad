@@ -127,7 +127,7 @@ export function checkoutFancy(
     // still in a linear (non-divergent) walk, skip retreat/advance.
     const op = oplog.ops[lv]
     const parentIsCritical =
-      op.parents.length === 1 && isCriticalVersion(op.parents[0])
+      op.parents.length === 1 && isCriticalVersion(oplog, op.parents[0])
 
     if (parentIsCritical && doc.currentVersion.length === 1 &&
         doc.currentVersion[0] === op.parents[0]) {

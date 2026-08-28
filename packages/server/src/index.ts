@@ -17,7 +17,7 @@ import { drizzle } from 'drizzle-orm/postgres-js'
 import * as schema from './db/schema.js'
 import { createNewDocument, ensureDocumentLoaded } from './sessions/sessionManager.js'
 import { registerWsHandler } from './sync/wsHandler.js'
-import { getSession } from './sessions/sessionStore.js'
+import { getSession, getPeersInfo } from './sessions/sessionStore.js'
 import type { DB } from './db/queries.js'
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
@@ -104,11 +104,7 @@ async function main() {
       return reply.send({
         docId: session.docId,
         text: session.doc.getText(),
-        peers: Array.from(session.peers.values()).map(p => ({
-          agentId: p.agentId,
-          name: p.name,
-          color: p.color,
-        })),
+        peers: getPeersInfo(session),
       })
     },
   )
@@ -117,7 +113,7 @@ async function main() {
   app.get('/health', async (_req, reply) => reply.send({ ok: true }))
 
   // ── WebSocket ────────────────────────────────────────────────────────────────
-  registerWsHandler(app, db)
+  registerWsHandler(app, db, sql)
 
   // ── Start ────────────────────────────────────────────────────────────────────
   await app.listen({ port: PORT, host: HOST })

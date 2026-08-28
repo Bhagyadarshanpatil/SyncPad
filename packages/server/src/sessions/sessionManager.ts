@@ -29,6 +29,7 @@ import {
   getOrCreateSession,
   type SessionState,
 } from './sessionStore.js'
+import { applyRemoteOps } from '../sync/mergeEngine.js'
 
 // ─── Peer identity ────────────────────────────────────────────────────────────
 
@@ -56,47 +57,59 @@ export async function createNewDocument(db: DB, name?: string): Promise<string> 
  *
  * If no critical version exists, load all ops from scratch.
  */
-export async function ensureDocumentLoaded(
-  db: DB,
-  docId: string,
-): Promise<SessionState> {
-  // Auto-create the document if it doesn't exist yet.
-  // This lets clients join any URL hash without a separate "create" step.
-  let dbDoc = await getDocument(db, docId)
-  if (!dbDoc) {
-    await createDocument(db, docId)
-    dbDoc = await getDocument(db, docId)
+const loadingSessions = new Map<string, Promise<SessionState>>()
+
+export function ensureDocumentLoaded(db: DB, docId: string): Promise<SessionState> {
+  if (loadingSessions.has(docId)) {
+    return loadingSessions.get(docId)!
   }
 
-  const session = getOrCreateSession(docId)
+  const p = (async () => {
+    try {
+      // Auto-create the document if it doesn't exist yet.
+      let dbDoc = await getDocument(db, docId)
+      if (!dbDoc) {
+        await createDocument(db, docId)
+        dbDoc = await getDocument(db, docId)
+      }
 
-  // If already loaded (has ops), skip.
-  if (session.doc.oplog.ops.length > 0) return session
+      const session = getOrCreateSession(docId)
 
-  // Load persisted critical versions first (populates the in-memory registry).
-  const cvRows = await getCriticalVersionsForDoc(db, docId)
-  const _cvs: CriticalVersion[] = cvRows.map(row => ({
-    lv: -1, // LV is not persisted — will be resolved after ops load.
-    id: [row.agentId, row.seq],
-    snapshot: row.snapshot,
-  }))
+      // If already loaded (has ops), skip.
+      if (session.doc.oplog.ops.length > 0) return session
 
-  // Load all ops from DB and rebuild the document state.
-  const allWireOps = await getAllOps(db, docId)
+      // Load persisted critical versions first (populates the in-memory registry).
+      const cvRows = await getCriticalVersionsForDoc(db, docId)
+      const cvs: CriticalVersion[] = cvRows.map(row => ({
+        lv: -1, // LV is not persisted — will be resolved after ops load.
+        id: [row.agentId, row.seq],
+        snapshot: row.snapshot,
+      }))
+      
+      // Cold-start optimization: load critical versions into the CRDT
+      if (cvs.length > 0) {
+        loadCriticalVersions(session.doc.oplog, cvs)
+      }
 
-  for (const wire of allWireOps) {
-    pushRemoteOp(session.doc.oplog, wireOpToRemoteOp(wire))
-  }
+      // Load all ops from DB and rebuild the document state.
+      // Use applyRemoteOps instead of pushRemoteOp directly to correctly handle
+      // any ops that were inserted out-of-order due to database transaction races.
+      const allWireOps = await getAllOps(db, docId)
+      if (allWireOps.length > 0) {
+        await applyRemoteOps(db, session, allWireOps, false)
+      }
 
-  // Rebuild the branch from the oplog.
-  if (allWireOps.length > 0) {
-    checkoutFancy(session.doc.oplog, session.doc.branch)
-  }
+      // Wire up the critical-version persistence callback.
+      session.doc.onCriticalVersion = async (cv) => {
+        await upsertCriticalVersion(db, docId, cv.id[0], cv.id[1], cv.snapshot)
+      }
 
-  // Wire up the critical-version persistence callback.
-  session.doc.onCriticalVersion = async (cv) => {
-    await upsertCriticalVersion(db, docId, cv.id[0], cv.id[1], cv.snapshot)
-  }
+      return session
+    } finally {
+      loadingSessions.delete(docId)
+    }
+  })()
 
-  return session
+  loadingSessions.set(docId, p)
+  return p
 }

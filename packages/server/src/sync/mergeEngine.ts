@@ -41,18 +41,27 @@ export async function applyRemoteOps(
   db: DB,
   session: SessionState,
   wireOps: WireOp[],
+  persist: boolean = true,
 ): Promise<MergeResult> {
   const { doc } = session
   const newOps: WireOp[] = []
   
   // Maintain a buffer on the session if it doesn't exist
   if (!session.outOfOrderBuffer) {
-    session.outOfOrderBuffer = new Map<string, WireOp>()
+    session.outOfOrderBuffer = new Map()
   }
   const buffer = session.outOfOrderBuffer
 
   // Queue incoming ops for processing
   const toProcess = [...wireOps]
+  const now = Date.now()
+
+  // Clean up old buffered ops (memory leak prevention)
+  for (const [key, item] of buffer) {
+    if (now - item.addedAt > 60000) { // 60 seconds TTL
+      buffer.delete(key)
+    }
+  }
 
   while (toProcess.length > 0) {
     const wire = toProcess.shift()!
@@ -62,20 +71,16 @@ export async function applyRemoteOps(
         newOps.push(wire)
         
         // A new op was successfully integrated! 
-        // Check if this unblocks any buffered ops.
-        // For simplicity, we just re-evaluate all buffered ops. 
-        // (A more optimized approach would map missing parent IDs to buffered ops).
         if (buffer.size > 0) {
-          toProcess.push(...buffer.values())
+          toProcess.push(...Array.from(buffer.values()).map(v => v.op))
           buffer.clear()
         }
       }
     } catch (err) {
       // Out-of-order delivery: the parent isn't here yet.
-      // Buffer it. We use agentId:seq as a unique key.
       const key = `${wire.agentId}:${wire.seq}`
       if (!buffer.has(key)) {
-        buffer.set(key, wire)
+        buffer.set(key, { op: wire, addedAt: now })
         console.log(`[merge] Buffered out-of-order op [${key}]`)
       }
     }
@@ -102,8 +107,10 @@ export async function applyRemoteOps(
     }
   }
 
-  // Persist to DB (fire-and-forget; don't block the merge).
-  persistAsync(db, session.docId, newOps, criticalVersionsDetected)
+  // Persist to DB if requested (fire-and-forget; don't block the merge).
+  if (persist) {
+    persistAsync(db, session.docId, newOps, criticalVersionsDetected)
+  }
 
   return { newOps, criticalVersionsDetected }
 }

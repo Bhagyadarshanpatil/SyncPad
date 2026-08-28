@@ -22,16 +22,19 @@ export interface ConnectedPeer {
   picture?: string
   color: string
   cursor?: number
+  lastSeen?: number
 }
 
 export interface SessionState {
   docId: string
   /** The authoritative server document. */
   doc: CRDTDocument
-  /** All connected WebSocket clients. */
+  /** All connected WebSocket clients on this instance. */
   peers: Map<string, ConnectedPeer> // agentId → peer
+  /** Connected WebSocket clients on other instances. */
+  remotePeers: Map<string, PeerInfo[]> // instanceId -> PeerInfo[]
   /** Buffer for out-of-order ops */
-  outOfOrderBuffer?: Map<string, any>
+  outOfOrderBuffer?: Map<string, { op: WireOp; addedAt: number }>
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -49,6 +52,7 @@ export function getOrCreateSession(docId: string): SessionState {
       docId,
       doc: new CRDTDocument(`server-${docId}`),
       peers: new Map(),
+      remotePeers: new Map(),
     }
     sessions.set(docId, session)
   }
@@ -71,15 +75,11 @@ export function addPeer(session: SessionState, peer: ConnectedPeer): void {
 
 export function removePeer(session: SessionState, agentId: string): void {
   session.peers.delete(agentId)
-  if (session.peers.size === 0) {
-    // Keep the session alive (in-memory) for 5 minutes in case they reconnect.
-    // In production, you'd also free memory if idle too long.
-  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-export function getPeersInfo(session: SessionState): PeerInfo[] {
+export function getLocalPeersInfo(session: SessionState): PeerInfo[] {
   return Array.from(session.peers.values()).map(p => ({
     agentId: p.agentId,
     userId: p.userId,
@@ -88,6 +88,12 @@ export function getPeersInfo(session: SessionState): PeerInfo[] {
     color: p.color,
     cursor: p.cursor,
   }))
+}
+
+export function getPeersInfo(session: SessionState): PeerInfo[] {
+  const local = getLocalPeersInfo(session)
+  const remote = Array.from(session.remotePeers.values()).flat()
+  return [...local, ...remote]
 }
 
 /**

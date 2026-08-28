@@ -58,6 +58,10 @@ export interface OpLog {
   frontier: LV[]
   /** Highest seq seen per agent — used for dedup and ordering. */
   version: VersionMap
+  /** Set of LVs that have been confirmed as critical versions. */
+  criticalLVs?: Set<LV>
+  /** Full CriticalVersion records (LV + Id + snapshot). */
+  criticalVersions?: CriticalVersion[]
 }
 
 // ─── CRDT document state ─────────────────────────────────────────────────────
@@ -195,6 +199,7 @@ export interface PeerInfo {
   picture?: string
   color: string
   cursor?: number
+  lastSeen?: number // Timestamp of last ping (server only)
 }
 
 // ─── Undo types (re-exported here so index.ts can forward them) ───────────────
