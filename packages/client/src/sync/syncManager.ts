@@ -86,13 +86,14 @@ export async function initSync(docId: string): Promise<void> {
 
 function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOfflineOps: WireOp[]) {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  // In dev, proxy through Vite (ws://localhost:5173/api/ws) -> Fastify
-  // Wait, vite proxy config doesn't proxy /ws by default unless configured.
-  // We can just connect directly to 3001 in dev, or use Vite proxy.
-  // Vite proxy is configured to rewrite ^/api to http://localhost:3001. So /api/ws works.
-  const wsUrl = import.meta.env.DEV 
-    ? `ws://localhost:3001/ws` 
-    : `${protocol}//${window.location.host}/ws`
+  
+  // Use VITE_WS_URL if provided (e.g. for production Cloud Run direct connection)
+  // Otherwise default to local dev or same-origin
+  const wsUrl = import.meta.env.VITE_WS_URL 
+    ? import.meta.env.VITE_WS_URL
+    : import.meta.env.DEV 
+      ? `ws://localhost:3001/ws` 
+      : `${protocol}//${window.location.host}/ws`
 
   ws = new WebSocket(wsUrl)
   const store = useStore.getState()
