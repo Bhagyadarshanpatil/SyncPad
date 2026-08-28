@@ -1,0 +1,213 @@
+import { v4 as uuid } from 'uuid'
+import {
+  CRDTDocument,
+  getVersionMap,
+  type ClientMessage,
+  type ServerMessage,
+  type WireOp
+} from '@syncpad/egwalker-core'
+import { useStore } from '../store'
+import {
+  saveOfflineOps,
+  getOfflineOps,
+  deleteOfflineOps
+} from './db'
+
+let ws: WebSocket | null = null
+let pingInterval: ReturnType<typeof setInterval>
+let isInitializing = false
+
+export async function initSync(docId: string): Promise<void> {
+  // Guard: if already initializing (React StrictMode double-invoke), skip.
+  if (isInitializing) {
+    console.log('[sync] initSync already in progress, skipping duplicate call')
+    return
+  }
+  isInitializing = true
+
+  const store = useStore.getState()
+  
+  // 1. Setup identity and Doc
+  // We ALWAYS generate a fresh replica ID (agentId) on load.
+  // This guarantees that if a user duplicates a tab, it still acts as a unique replica.
+  // The user's actual identity is tied to Google Auth, so they will still appear as themselves!
+  const agentId = uuid()
+  
+  const doc = new CRDTDocument(agentId)
+  store.setDocId(docId)
+  store.setAgentId(agentId)
+  store.setDoc(doc)
+
+  // 2. Load offline ops from IDB (only for THIS agent) and apply them
+  const offlineRecs = await getOfflineOps(docId)
+  const offlineOps = offlineRecs.map(r => r.op).filter(op => op.agentId === agentId)
+  if (offlineOps.length > 0) {
+    doc.applyRemote(offlineOps)
+    store.incDocVersion()
+  }
+
+  // 3. Connect WebSocket
+  connectWs(docId, agentId, doc, offlineOps)
+  isInitializing = false
+}
+
+function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOfflineOps: WireOp[]) {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  // In dev, proxy through Vite (ws://localhost:5173/api/ws) -> Fastify
+  // Wait, vite proxy config doesn't proxy /ws by default unless configured.
+  // We can just connect directly to 3001 in dev, or use Vite proxy.
+  // Vite proxy is configured to rewrite ^/api to http://localhost:3001. So /api/ws works.
+  const wsUrl = import.meta.env.DEV 
+    ? `ws://localhost:3001/ws` 
+    : `${protocol}//${window.location.host}/ws`
+
+  ws = new WebSocket(wsUrl)
+  const store = useStore.getState()
+
+  ws.onopen = () => {
+    store.setStatus('connected')
+    console.log(`[sync] Connected! agentId=${agentId} docId=${docId}`)
+    
+    // Join room
+    const knownVersions = getVersionMap(doc.oplog)
+    console.log(`[sync] Sending JOIN`, { docId, agentId, knownVersions })
+    sendMsg({
+      type: 'join',
+      docId,
+      agentId,
+      knownVersions,
+      token: store.user?.token
+    })
+
+    // If we have pending offline ops, send them as catchup
+    if (pendingOfflineOps.length > 0) {
+      console.log(`[sync] Sending CATCHUP with ${pendingOfflineOps.length} offline ops`)
+      sendMsg({
+        type: 'catchup',
+        docId,
+        ops: pendingOfflineOps
+      })
+    }
+  }
+
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data) as ServerMessage
+    console.log(`[sync] Received:`, msg.type, msg)
+    
+    switch (msg.type) {
+      case 'peers':
+        useStore.getState().setPeers(msg.peers)
+        break
+        
+      case 'ops':
+      case 'catchup': {
+        // IMPORTANT: always get the doc from the store, NOT the closure.
+        // In React StrictMode, initSync may run twice, creating two WebSocket
+        // connections. The closure `doc` may be stale (from the first mount).
+        // The store always has the current, live document.
+        const currentDoc = useStore.getState().doc
+        if (!currentDoc) break
+        console.log(`[sync] Applying ${msg.ops.length} remote ops to doc`)
+        currentDoc.applyRemote(msg.ops)
+        useStore.getState().incDocVersion()
+        break
+      }
+        
+      case 'cursor':
+        useStore.getState().updatePeerCursor(msg.agentId, msg.cursor)
+        break
+        
+      case 'ack':
+        await clearOfflineOps(docId, msg.opIds)
+        break
+        
+      case 'error':
+        console.error('[sync] Server error:', msg.message)
+        if (msg.message.includes('uthentication')) {
+          useStore.getState().setUser(null)
+          localStorage.removeItem('syncpad:user')
+          // Optional: we can close the socket, but the server already closes it.
+        }
+        break
+    }
+  }
+
+  ws.onclose = () => {
+    store.setStatus('offline')
+    setTimeout(() => connectWs(docId, agentId, doc, []), 3000) // Reconnect loop
+  }
+
+  ws.onerror = () => {
+    // onclose will handle reconnect
+  }
+
+  // Cursor ping loop
+  clearInterval(pingInterval)
+  pingInterval = setInterval(() => {
+    if (ws?.readyState === WebSocket.OPEN) {
+      // Find my own peer info to get name
+      const me = useStore.getState().peers.find(p => p.agentId === agentId)
+      if (me?.cursor !== undefined) {
+        sendMsg({
+          type: 'ping',
+          docId,
+          cursor: me.cursor,
+          name: store.user?.name || me.name,
+          picture: store.user?.picture
+        })
+      }
+    }
+  }, 1000)
+}
+
+export function closeSync() {
+  isInitializing = false  // Allow re-init after close
+  if (ws) {
+    ws.onclose = null // Prevent reconnect loop
+    ws.close()
+    ws = null
+  }
+  clearInterval(pingInterval)
+}
+
+function sendMsg(msg: ClientMessage) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg))
+  }
+}
+
+/**
+ * Called by Editor when user types.
+ */
+export async function broadcastOps(ops: WireOp[]) {
+  const store = useStore.getState()
+  const docId = store.docId
+  if (!docId) return
+  
+  console.log(`[sync] Broadcasting ${ops.length} ops, wsState=${ws?.readyState}`)
+  
+  // 1. Optimistically save to IDB in case we're offline
+  await saveOfflineOps(docId, ops)
+  
+  // 2. Send over WS
+  if (ws?.readyState === WebSocket.OPEN) {
+    sendMsg({
+      type: 'ops',
+      docId,
+      ops
+    })
+  } else {
+    console.warn(`[sync] WS not open (state=${ws?.readyState}), ops saved to IDB only`)
+  }
+}
+
+async function clearOfflineOps(docId: string, ackedIds: [string, number][]) {
+  const recs = await getOfflineOps(docId)
+  const toDelete = recs.filter(r => {
+    return ackedIds.some(([a, s]) => r.op.agentId === a && r.op.seq === s)
+  })
+  
+  if (toDelete.length > 0) {
+    await deleteOfflineOps(toDelete.map(r => r.id!))
+  }
+}

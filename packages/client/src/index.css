@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .conflict-highlight {
+    animation: conflictFade 2s ease-out forwards;
+  }
+}
+
+@keyframes conflictFade {
+  0% { background-color: #fef08a; } /* yellow-200 */
+  100% { background-color: transparent; }
+}
+
+/* React Flow customizations */
+.react-flow__node {
+  border-radius: 4px;
+}
+.react-flow__handle {
+  width: 6px;
+  height: 6px;
+}

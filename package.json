@@ -1,0 +1,13 @@
+{
+  "name": "syncpad",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "concurrently \"pnpm -F @syncpad/server dev\" \"pnpm -F @syncpad/client dev\"",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}
