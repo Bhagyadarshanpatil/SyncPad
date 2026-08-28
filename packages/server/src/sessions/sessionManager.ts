@@ -100,8 +100,10 @@ export function ensureDocumentLoaded(db: DB, docId: string): Promise<SessionStat
       }
 
       // Wire up the critical-version persistence callback.
-      session.doc.onCriticalVersion = async (cv) => {
-        await upsertCriticalVersion(db, docId, cv.id[0], cv.id[1], cv.snapshot)
+      session.doc.onCriticalVersion = (cv) => {
+        upsertCriticalVersion(db, docId, cv.id[0], cv.id[1], cv.snapshot).catch(err => {
+          console.error('[db] Error upserting critical version:', err)
+        })
       }
 
       return session
