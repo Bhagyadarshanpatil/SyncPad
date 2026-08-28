@@ -1,0 +1,59 @@
+steps:
+  # 1. Build the Docker image
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - --no-cache
+      - -t
+      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - .
+      - -f
+      - Dockerfile
+
+  # 2. Push to Artifact Registry
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+
+  # 3. Deploy to Cloud Run (env vars come from trigger substitution variables)
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - $_SERVICE_NAME
+      - --platform=managed
+      - --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+      - --region=$_DEPLOY_REGION
+      - --no-use-http2
+      - --update-env-vars=DATABASE_URL=$_DATABASE_URL,GOOGLE_CLIENT_ID=$_GOOGLE_CLIENT_ID
+      - --labels=managed-by=gcp-cloud-build-deploy-cloud-run,commit-sha=$COMMIT_SHA,gcb-build-id=$BUILD_ID,gcb-trigger-id=$_TRIGGER_ID
+      - --quiet
+
+images:
+  - $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/$REPO_NAME/$_SERVICE_NAME:$COMMIT_SHA
+
+substitutions:
+  REPO_NAME: syncpad
+  _AR_HOSTNAME: asia-south1-docker.pkg.dev
+  _AR_PROJECT_ID: sync-pad-4444
+  _AR_REPOSITORY: cloud-run-source-deploy
+  _DEPLOY_REGION: asia-south1
+  _SERVICE_NAME: syncpad
+  _TRIGGER_ID: 420d4d95-6769-41bf-9e50-7b1256d59e04
+  # _DATABASE_URL and _GOOGLE_CLIENT_ID are set in the Cloud Build trigger
+  # substitutions (not here) so they are never committed to git.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
+
+tags:
+  - gcp-cloud-build-deploy-cloud-run
+  - gcp-cloud-build-deploy-cloud-run-managed
+  - syncpad
