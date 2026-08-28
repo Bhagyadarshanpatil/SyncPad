@@ -53,7 +53,7 @@ export type { EncodedOpLog } from './columnarEncoder.js'
 
 import { createOpLog, localInsert, localDelete, mergeInto, oplogToWireOps, getMissingOps } from './oplog.js'
 import { checkoutFancy, createBranch, checkout } from './checkout.js'
-import { createUndoState, pushToUndoStack } from './undo.js'
+import { createUndoState, pushToUndoStack, undo as _undo, redo as _redo } from './undo.js'
 import { detectCriticalVersion } from './criticalVersion.js'
 import type { Branch, OpLog, UndoState, WireOp, VersionMap, CriticalVersion } from './types.js'
 import { pushRemoteOp, wireOpToRemoteOp } from './oplog.js'
@@ -93,14 +93,57 @@ export class CRDTDocument {
     this._checkCritical()
     return lvs.map(lv => this._toWire(lv))
   }
+  
+  /** Undo the last local action. */
+  undo(): WireOp[] | null {
+    const doc = checkoutFancy(this.oplog, { snapshot: [], frontier: [] }, this.oplog.frontier)
+    const res = _undo(this.oplog, this.branch, doc, this.undoState, this.agentId)
+    if (!res) return null
+    this.branch.frontier = this.oplog.frontier.slice()
+    this._checkCritical()
+    return res.inverseLVs.map(lv => this._toWire(lv))
+  }
+
+  /** Redo the last undone action. */
+  redo(): WireOp[] | null {
+    const doc = checkoutFancy(this.oplog, { snapshot: [], frontier: [] }, this.oplog.frontier)
+    const res = _redo(this.oplog, this.branch, doc, this.undoState, this.agentId)
+    if (!res) return null
+    this.branch.frontier = this.oplog.frontier.slice()
+    this._checkCritical()
+    return res.inverseLVs.map(lv => this._toWire(lv))
+  }
+
+  outOfOrderBuffer = new Map<string, WireOp>()
 
   /** Apply incoming remote WireOps and update the branch. */
   applyRemote(wireOps: WireOp[]): void {
-    for (const wire of wireOps) {
-      pushRemoteOp(this.oplog, wireOpToRemoteOp(wire))
+    let appliedAny = false
+    const toProcess = [...wireOps]
+
+    while (toProcess.length > 0) {
+      const wire = toProcess.shift()!
+      try {
+        const lv = pushRemoteOp(this.oplog, wireOpToRemoteOp(wire))
+        if (lv !== -1) {
+          appliedAny = true
+          if (this.outOfOrderBuffer.size > 0) {
+            toProcess.push(...this.outOfOrderBuffer.values())
+            this.outOfOrderBuffer.clear()
+          }
+        }
+      } catch (err) {
+        const key = `${wire.agentId}:${wire.seq}`
+        if (!this.outOfOrderBuffer.has(key)) {
+          this.outOfOrderBuffer.set(key, wire)
+        }
+      }
     }
-    checkoutFancy(this.oplog, this.branch)
-    this._checkCritical()
+
+    if (appliedAny) {
+      checkoutFancy(this.oplog, this.branch)
+      this._checkCritical()
+    }
   }
 
   /** Get ops the remote peer doesn't have yet (for catch-up). */

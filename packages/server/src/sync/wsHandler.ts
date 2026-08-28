@@ -18,6 +18,8 @@ import {
   type ClientMessage,
   type ServerMessage,
   type WireOp,
+  encodeWireOps,
+  decodeOpLog
 } from '@syncpad/egwalker-core'
 import type { DB } from '../db/queries.js'
 import { ensureDocumentLoaded } from '../sessions/sessionManager.js'
@@ -32,6 +34,16 @@ import {
   type SessionState,
 } from '../sessions/sessionStore.js'
 import { applyRemoteOps, getCatchupOps } from './mergeEngine.js'
+
+// Helper to convert Uint8Array to base64
+function toBase64(arr: Uint8Array): string {
+  return Buffer.from(arr).toString('base64')
+}
+
+// Helper to convert base64 to Uint8Array
+function fromBase64(b64: string): Uint8Array {
+  return new Uint8Array(Buffer.from(b64, 'base64'))
+}
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -92,8 +104,20 @@ export function registerWsHandler(app: FastifyInstance, db: DB): void {
                 send(socket, { type: 'error', message: 'Not joined to a document' })
                 return
               }
-              console.log(`[ws] ${msg.type.toUpperCase()} docId=${msg.docId} ops=${msg.ops.length} from=${currentAgentId}`)
-              await handleOps(socket, db, msg.docId, msg.ops, currentAgentId)
+              
+              let opsToProcess: WireOp[] = []
+              if ('encoding' in msg && msg.encoding === 'binary' && msg.payload) {
+                const buffer = fromBase64(msg.payload)
+                opsToProcess = decodeOpLog(buffer)
+                console.log(`[ws] CATCHUP (binary) docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
+              } else if ('ops' in msg && msg.ops) {
+                opsToProcess = msg.ops
+                console.log(`[ws] ${msg.type.toUpperCase()} docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
+              }
+              
+              if (opsToProcess.length > 0) {
+                await handleOps(socket, db, msg.docId, opsToProcess, currentAgentId)
+              }
               break
 
             case 'ping':
@@ -197,7 +221,13 @@ async function handleJoin(
   // Send catch-up ops the client is missing.
   const catchupOps = await getCatchupOps(db, docId, knownVersions)
   if (catchupOps.length > 0) {
-    send(socket, { type: 'catchup', docId, ops: catchupOps })
+    const encoded = encodeWireOps(catchupOps)
+    send(socket, {
+      type: 'catchup',
+      docId,
+      encoding: 'binary',
+      payload: toBase64(encoded.buffer)
+    })
   }
 
   // Send ACK of join + current peer list to joining client.

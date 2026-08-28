@@ -30,6 +30,8 @@ export interface SessionState {
   doc: CRDTDocument
   /** All connected WebSocket clients. */
   peers: Map<string, ConnectedPeer> // agentId → peer
+  /** Buffer for out-of-order ops */
+  outOfOrderBuffer?: Map<string, any>
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────

@@ -103,11 +103,9 @@ export function undo(
       snapshotDelta = { type: 'del', pos: visPos }
     }
   } else {
-    // Undo a delete → re-insert the character.
-    // Find the original item by scanning delTargets.
-    const deletedItemLV = doc.delTargets
-      .map((dlv, delOpLv) => ({ dlv, delOpLv }))
-      .find(({ delOpLv }) => delOpLv === targetLV)?.dlv
+    // Undo a delete -> re-insert the character.
+    // Find the original item directly since delTargets maps delOpLv to dlv.
+    const deletedItemLV = doc.delTargets[targetLV]
 
     if (deletedItemLV == null) {
       // Can't find the deleted item — skip.

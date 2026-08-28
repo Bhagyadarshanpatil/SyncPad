@@ -44,18 +44,40 @@ export async function applyRemoteOps(
 ): Promise<MergeResult> {
   const { doc } = session
   const newOps: WireOp[] = []
+  
+  // Maintain a buffer on the session if it doesn't exist
+  if (!session.outOfOrderBuffer) {
+    session.outOfOrderBuffer = new Map<string, WireOp>()
+  }
+  const buffer = session.outOfOrderBuffer
 
-  for (const wire of wireOps) {
+  // Queue incoming ops for processing
+  const toProcess = [...wireOps]
+
+  while (toProcess.length > 0) {
+    const wire = toProcess.shift()!
     try {
       const lv = pushRemoteOp(doc.oplog, wireOpToRemoteOp(wire))
       if (lv !== -1) {
-        // lv === -1 means it was already known (duplicate), skip.
         newOps.push(wire)
+        
+        // A new op was successfully integrated! 
+        // Check if this unblocks any buffered ops.
+        // For simplicity, we just re-evaluate all buffered ops. 
+        // (A more optimized approach would map missing parent IDs to buffered ops).
+        if (buffer.size > 0) {
+          toProcess.push(...buffer.values())
+          buffer.clear()
+        }
       }
     } catch (err) {
       // Out-of-order delivery: the parent isn't here yet.
-      // In production, buffer and retry. For now, log and skip.
-      console.warn(`[merge] Could not apply op [${wire.agentId}:${wire.seq}]:`, (err as Error).message)
+      // Buffer it. We use agentId:seq as a unique key.
+      const key = `${wire.agentId}:${wire.seq}`
+      if (!buffer.has(key)) {
+        buffer.set(key, wire)
+        console.log(`[merge] Buffered out-of-order op [${key}]`)
+      }
     }
   }
 

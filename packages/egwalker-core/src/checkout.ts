@@ -70,8 +70,16 @@ export function checkoutFancy(
   oplog: OpLog,
   branch: Branch,
   mergeFrontier: LV[] = oplog.frontier,
-): void {
-  if (mergeFrontier.length === 0) return
+): CRDTDoc {
+  if (mergeFrontier.length === 0) {
+    return {
+      items: [],
+      currentVersion: [],
+      delTargets: [],
+      itemsByLV: [],
+      placeholders: new Map(),
+    }
+  }
 
   const { commonVersion, sharedOps, bOnlyOps } = findOpsToVisit(
     oplog,
@@ -87,18 +95,18 @@ export function checkoutFancy(
     placeholders: new Map(),
   }
 
-  // Build placeholder items for all ops in the existing branch snapshot.
-  // These stand in for the branch's known content without storing CRDTItems.
+  // Build a SINGLE placeholder item for all ops in the existing branch snapshot.
+  // This turns O(N) object allocation into O(1).
   const placeholderLength = branch.frontier.length > 0
     ? Math.max(...branch.frontier) + 1
     : 0
 
-  for (let i = 0; i < placeholderLength; i++) {
+  if (placeholderLength > 0) {
     const ph: PlaceholderItem = {
       isPlaceholder: true,
-      lv: i + 1e12, // out-of-range LV, never a real op
-      startPos: i,
-      endPos: i + 1,
+      lv: 0 + 1e12, // startPos + 1e12
+      startPos: 0,
+      endPos: placeholderLength,
       curState: INSERTED,
       deleted: false,
       originLeft: -1,
@@ -132,6 +140,8 @@ export function checkoutFancy(
 
     branch.frontier = advanceFrontier(branch.frontier, lv, op.parents)
   }
+
+  return doc
 }
 
 export function createBranch(): Branch {

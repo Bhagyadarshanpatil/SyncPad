@@ -4,7 +4,9 @@ import {
   getVersionMap,
   type ClientMessage,
   type ServerMessage,
-  type WireOp
+  type WireOp,
+  encodeWireOps,
+  decodeOpLog
 } from '@syncpad/egwalker-core'
 import { useStore } from '../store'
 import {
@@ -13,9 +15,39 @@ import {
   deleteOfflineOps
 } from './db'
 
+// Helper to convert Uint8Array to base64
+function toBase64(arr: Uint8Array): string {
+  return btoa(String.fromCharCode.apply(null, arr as any))
+}
+
+// Helper to convert base64 to Uint8Array
+function fromBase64(b64: string): Uint8Array {
+  const str = atob(b64)
+  const arr = new Uint8Array(str.length)
+  for (let i = 0; i < str.length; i++) {
+    arr[i] = str.charCodeAt(i)
+  }
+  return arr
+}
+
 let ws: WebSocket | null = null
 let pingInterval: ReturnType<typeof setInterval>
 let isInitializing = false
+
+if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data?.type === 'trigger-sync') {
+      console.log('[sync] Received trigger-sync from SW')
+      const store = useStore.getState()
+      if (store.docId && (!ws || ws.readyState === WebSocket.CLOSED)) {
+        console.log('[sync] Reconnecting due to background sync event')
+        // Close old and re-init to pull offline ops and connect
+        closeSync()
+        initSync(store.docId)
+      }
+    }
+  })
+}
 
 export async function initSync(docId: string): Promise<void> {
   // Guard: if already initializing (React StrictMode double-invoke), skip.
@@ -38,10 +70,11 @@ export async function initSync(docId: string): Promise<void> {
   store.setAgentId(agentId)
   store.setDoc(doc)
 
-  // 2. Load offline ops from IDB (only for THIS agent) and apply them
+  // 2. Load offline ops from IDB (all unsynced ops for this document)
   const offlineRecs = await getOfflineOps(docId)
-  const offlineOps = offlineRecs.map(r => r.op).filter(op => op.agentId === agentId)
+  const offlineOps = offlineRecs.map(r => r.op)
   if (offlineOps.length > 0) {
+    console.log(`[sync] Loaded ${offlineOps.length} offline ops from IDB`)
     doc.applyRemote(offlineOps)
     store.incDocVersion()
   }
@@ -82,10 +115,12 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
     // If we have pending offline ops, send them as catchup
     if (pendingOfflineOps.length > 0) {
       console.log(`[sync] Sending CATCHUP with ${pendingOfflineOps.length} offline ops`)
+      const encoded = encodeWireOps(pendingOfflineOps)
       sendMsg({
         type: 'catchup',
         docId,
-        ops: pendingOfflineOps
+        encoding: 'binary',
+        payload: toBase64(encoded.buffer)
       })
     }
   }
@@ -96,25 +131,32 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
     
     switch (msg.type) {
       case 'peers':
-        useStore.getState().setPeers(msg.peers)
+        useStore.getState().setPeers((msg as any).peers)
         break
         
       case 'ops':
       case 'catchup': {
-        // IMPORTANT: always get the doc from the store, NOT the closure.
-        // In React StrictMode, initSync may run twice, creating two WebSocket
-        // connections. The closure `doc` may be stale (from the first mount).
-        // The store always has the current, live document.
         const currentDoc = useStore.getState().doc
         if (!currentDoc) break
-        console.log(`[sync] Applying ${msg.ops.length} remote ops to doc`)
-        currentDoc.applyRemote(msg.ops)
-        useStore.getState().incDocVersion()
+        
+        let opsToApply: WireOp[] = []
+        if ('encoding' in msg && msg.encoding === 'binary' && msg.payload) {
+          const buffer = fromBase64(msg.payload)
+          opsToApply = decodeOpLog(buffer)
+        } else if ('ops' in msg && msg.ops) {
+          opsToApply = msg.ops
+        }
+
+        if (opsToApply.length > 0) {
+          console.log(`[sync] Applying ${opsToApply.length} remote ops to doc`)
+          currentDoc.applyRemote(opsToApply)
+          useStore.getState().incDocVersion()
+        }
         break
       }
         
       case 'cursor':
-        useStore.getState().updatePeerCursor(msg.agentId, msg.cursor)
+        useStore.getState().updatePeerCursor((msg as any).agentId, (msg as any).cursor)
         break
         
       case 'ack':
@@ -198,6 +240,17 @@ export async function broadcastOps(ops: WireOp[]) {
     })
   } else {
     console.warn(`[sync] WS not open (state=${ws?.readyState}), ops saved to IDB only`)
+    // Request Background Sync if supported
+    if ('serviceWorker' in navigator && 'SyncManager' in window) {
+      try {
+        const registration = await navigator.serviceWorker.ready
+        // @ts-ignore - TS doesn't know about sync yet by default
+        await registration.sync.register('syncpad-ops')
+        console.log('[sync] Background sync registered for offline ops')
+      } catch (err) {
+        console.error('[sync] Background sync registration failed', err)
+      }
+    }
   }
 }
 

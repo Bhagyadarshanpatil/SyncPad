@@ -15,6 +15,7 @@
  *   [Topology column: exception list for non-sequential parents]
  */
 
+import { compress, decompress } from 'lz4js'
 import type { OpLog, WireOp } from './types.js'
 import { oplogToWireOps } from './oplog.js'
 
@@ -161,10 +162,9 @@ export function encodeWireOps(wireOps: WireOp[]): EncodedOpLog {
     }
   }
 
-  // ── Simple LZ4-like compression (RLE) for content ────────────────────────
-  // A real implementation would use an LZ4 WASM library; here we use
-  // a stub that just encodes as UTF-8 (compression to be wired in Phase 3).
-  const contentBytes = new TextEncoder().encode(contentStr)
+  // ── LZ4 compression for content ──────────────────────────────────────────
+  const uncompressedContent = new TextEncoder().encode(contentStr)
+  const contentBytes = compress(uncompressedContent)
 
   // ── Topology column serialisation ─────────────────────────────────────────
   const topoBuf: number[] = []
@@ -236,7 +236,9 @@ export function decodeOpLog(buffer: Uint8Array): WireOp[] {
   }
 
   // Decode content column.
-  const contentStr = new TextDecoder().decode(buffer.slice(off, off + contentByteLen))
+  const compressedContent = buffer.slice(off, off + contentByteLen)
+  const decompressedContent = decompress(compressedContent)
+  const contentStr = new TextDecoder().decode(decompressedContent)
   off += contentByteLen
   const contentChars = [...contentStr]
 

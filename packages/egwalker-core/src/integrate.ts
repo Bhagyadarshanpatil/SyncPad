@@ -54,7 +54,7 @@ export function advance(doc: CRDTDoc, oplog: OpLog, opLv: LV): void {
 export function findByCurrentPos(
   items: DocItem[],
   targetPos: number,
-): { idx: number; endPos: number } {
+): { idx: number; endPos: number; offset: number } {
   let curPos = 0   // visible chars counted (curState === INSERTED)
   let endPos = 0   // non-deleted chars counted (for snapshot splicing)
   let idx = 0
@@ -62,11 +62,23 @@ export function findByCurrentPos(
   for (; curPos < targetPos; idx++) {
     if (idx >= items.length) throw new Error('Position past end of items list')
     const item = items[idx]
-    if (item.curState === INSERTED) curPos++
-    if (!item.deleted) endPos++
+    
+    const len = isPlaceholder(item) ? item.endPos - item.startPos : 1
+
+    if (item.curState === INSERTED) {
+      if (curPos + len > targetPos) {
+        // Target is inside this placeholder
+        const offset = targetPos - curPos
+        if (!item.deleted) endPos += offset
+        return { idx, endPos, offset }
+      }
+      curPos += len
+    }
+
+    if (!item.deleted) endPos += len
   }
 
-  return { idx, endPos }
+  return { idx, endPos, offset: 0 }
 }
 
 function findItemIdxAtLV(items: DocItem[], lv: LV): number {
@@ -166,28 +178,64 @@ export function apply(
   const op = oplog.ops[opLv]
 
   if (op.type === 'del') {
-    let { idx, endPos } = findByCurrentPos(doc.items, op.pos)
+    let { idx, endPos, offset } = findByCurrentPos(doc.items, op.pos)
 
     // Scan forward past NOT_YET_INSERTED items to find the actual live item.
-    while (doc.items[idx].curState !== INSERTED) {
-      if (!doc.items[idx].deleted) endPos++
+    while (doc.items[idx] && doc.items[idx].curState !== INSERTED) {
+      const it = doc.items[idx]
+      const len = isPlaceholder(it) ? it.endPos - it.startPos : 1
+      if (!it.deleted) endPos += len
       idx++
     }
 
     const item = doc.items[idx]
     if (isPlaceholder(item)) {
-      // Deleting inside a placeholder — the snapshot handles it.
-      if (!item.deleted) {
-        // Narrow the placeholder range.
-        item.endPos = Math.max(item.startPos, item.endPos - 1)
-        if (item.endPos === item.startPos) {
-          item.deleted = true
-          item.curState = 1
-        }
-        if (snapshot != null) snapshot.splice(endPos, 1)
+      if (item.deleted) {
+        // Already deleted, should not happen for a valid CRDT operation
+        return
       }
-      // Store target for retreat/advance — use a synthetic LV.
-      doc.delTargets[opLv] = item.lv
+      
+      // Splitting the placeholder
+      const delStart = item.startPos + offset
+      
+      const newDel: PlaceholderItem = {
+        isPlaceholder: true,
+        lv: delStart + 1e12,
+        startPos: delStart,
+        endPos: delStart + 1,
+        curState: 1, // Deleted
+        deleted: true,
+        originLeft: -1,
+        originRight: -1,
+      }
+
+      const replacements: DocItem[] = []
+      
+      if (offset > 0) {
+        replacements.push({
+          ...item,
+          endPos: delStart
+        })
+      }
+      
+      replacements.push(newDel)
+      
+      if (delStart + 1 < item.endPos) {
+        replacements.push({
+          ...item,
+          lv: (delStart + 1) + 1e12,
+          startPos: delStart + 1
+        })
+      }
+      
+      doc.items.splice(idx, 1, ...replacements)
+      
+      for (const r of replacements) {
+        if (isPlaceholder(r)) doc.placeholders!.set(r.lv, r)
+      }
+
+      if (snapshot != null) snapshot.splice(endPos, 1)
+      doc.delTargets[opLv] = newDel.lv
       return
     }
 

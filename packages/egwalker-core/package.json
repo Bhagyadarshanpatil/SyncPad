@@ -17,9 +17,12 @@
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
   "devDependencies": {
-    "typescript": "^5.4.5",
-    "jest": "^29.7.0",
     "@types/jest": "^29.5.12",
-    "ts-jest": "^29.1.5"
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.5",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "lz4js": "^0.2.0"
   }
 }

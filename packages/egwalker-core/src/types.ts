@@ -172,18 +172,18 @@ export type ClientMessage =
   | {
       type: 'join'
       docId: string
-      agentId: string // The CRDT replicaId
-      knownVersions: VersionMap
+      agentId: string
+      knownVersions: Record<string, number>
       token?: string // Google ID token for auth
     }
   | { type: 'ops'; docId: string; ops: WireOp[] }
-  | { type: 'catchup'; docId: string; ops: WireOp[] }
+  | { type: 'catchup'; docId: string; ops?: WireOp[]; encoding?: 'binary'; payload?: string }
   | { type: 'ping'; docId: string; cursor: number; name: string; picture?: string }
 
 export type ServerMessage =
   | { type: 'peers'; docId: string; peers: PeerInfo[] }
   | { type: 'ops'; docId: string; fromAgent: string; ops: WireOp[] }
-  | { type: 'catchup'; docId: string; ops: WireOp[] }
+  | { type: 'catchup'; docId: string; ops?: WireOp[]; encoding?: 'binary'; payload?: string }
   | { type: 'ack'; docId: string; opIds: [string, number][] }
   | { type: 'cursor'; docId: string; agentId: string; cursor: number; name: string; picture?: string }
   | { type: 'error'; message: string }
