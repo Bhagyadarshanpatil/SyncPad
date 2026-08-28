@@ -30,18 +30,25 @@ async function main() {
   const connectionString = process.env.DATABASE_URL
   if (!connectionString) throw new Error('DATABASE_URL is not set')
 
-  // Support Cloud SQL unix sockets via ?host=/cloudsql/... in the URL
+  // Support Cloud SQL unix sockets via ?host=/cloudsql/... in the URL.
+  // IMPORTANT: we must strip the ?host= param from the URL string before
+  // passing it to postgres.js — otherwise postgres.js forwards unknown query
+  // params as `SET host = ...` session commands, which PostgreSQL rejects
+  // with error 42704 ("unrecognized configuration parameter").
   let hostOverride: string | undefined = undefined
+  let cleanedConnectionString = connectionString
   try {
     const url = new URL(connectionString)
     if (url.searchParams.has('host')) {
       hostOverride = url.searchParams.get('host') || undefined
+      url.searchParams.delete('host') // Remove so postgres.js doesn't treat it as a SET param
+      cleanedConnectionString = url.toString()
     }
   } catch (e) {
     // Ignore URL parse errors, let postgres.js handle it
   }
 
-  const sql = postgres(connectionString, {
+  const sql = postgres(cleanedConnectionString, {
     max: 10,
     connect_timeout: 10,
     ...(hostOverride ? { host: hostOverride } : {})
