@@ -28,12 +28,13 @@ export function Editor() {
   // IMPORTANT: Do NOT subscribe to `peers` here!
   // Subscribing to peers here would cause the entire <textarea> to re-render 
   // on every single mouse movement of a remote user, causing severe main thread lag.
-  const { doc, docVersion, updatePeerCursor, agentId, timeTravelFrontier } = useStore(state => ({
+  const { doc, docVersion, updatePeerCursor, agentId, timeTravelFrontier, setTimeTravelFrontier } = useStore(state => ({
     doc: state.doc,
     docVersion: state.docVersion,
     updatePeerCursor: state.updatePeerCursor,
     agentId: state.agentId,
-    timeTravelFrontier: state.timeTravelFrontier
+    timeTravelFrontier: state.timeTravelFrontier,
+    setTimeTravelFrontier: state.setTimeTravelFrontier
   }))
   
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -58,9 +59,14 @@ export function Editor() {
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (!doc || !agentId) return
+    if (timeTravelFrontier !== null) {
+      setTimeTravelFrontier(null)
+      setLocalText(doc.getText())
+      return
+    }
     
     const newText = e.target.value
-    const diff = calcDiff(localText, newText)
+    const diff = calcDiff(doc.getText(), newText)
     
     let wireOps: any[] = []
     
@@ -122,17 +128,32 @@ export function Editor() {
 
   return (
     <div className="flex-1 p-6 flex flex-col h-full bg-white shadow-sm border-r border-gray-200 z-10 relative overflow-hidden">
+      {timeTravelFrontier !== null && (
+        <div className="mb-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded text-xs text-amber-800 flex justify-between items-center z-20">
+          <span>Viewing historical snapshot (Time Travel). Click editor or button to return to live editing.</span>
+          <button
+            onClick={() => setTimeTravelFrontier(null)}
+            className="ml-2 px-2 py-0.5 bg-amber-600 text-white rounded hover:bg-amber-700 font-medium"
+          >
+            Return to Live
+          </button>
+        </div>
+      )}
       <textarea
         ref={textareaRef}
         value={localText}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
+        onFocus={() => {
+          if (timeTravelFrontier !== null) {
+            setTimeTravelFrontier(null)
+          }
+        }}
         onSelect={handleSelect}
         onClick={handleSelect}
         onKeyUp={handleSelect}
         onScroll={handleScroll}
-        disabled={timeTravelFrontier !== null}
-        className={`w-full h-full resize-none outline-none text-gray-800 text-lg font-mono leading-relaxed bg-transparent z-10 relative ${timeTravelFrontier ? 'opacity-50 cursor-not-allowed' : ''}`}
+        className={`w-full h-full resize-none outline-none text-gray-800 text-lg font-mono leading-relaxed bg-transparent z-10 relative ${timeTravelFrontier ? 'opacity-60' : ''}`}
         placeholder="Start typing..."
         spellCheck={false}
       />

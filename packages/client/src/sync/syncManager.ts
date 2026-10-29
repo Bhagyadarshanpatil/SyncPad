@@ -39,15 +39,15 @@ let pingInterval: ReturnType<typeof setInterval>
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
 let syncSessionId = 0
 
-function tryReconnectExistingSession() {
+function tryReconnectExistingSession(force = false) {
   const store = useStore.getState()
   if (
     store.docId &&
     store.agentId &&
     store.doc &&
-    (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING))
+    (force || !ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING))
   ) {
-    console.log('[sync] Reconnecting existing session')
+    console.log('[sync] Reconnecting existing session (force=' + force + ')')
     if (reconnectTimeout) {
       clearTimeout(reconnectTimeout)
       reconnectTimeout = null
@@ -57,9 +57,24 @@ function tryReconnectExistingSession() {
 }
 
 if (typeof window !== 'undefined') {
+  window.addEventListener('offline', () => {
+    console.log('[sync] Browser offline event fired — closing socket')
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout)
+      reconnectTimeout = null
+    }
+    clearInterval(pingInterval)
+    if (ws) {
+      ws.onclose = null
+      ws.close()
+      ws = null
+    }
+    useStore.getState().setStatus('offline')
+  })
+
   window.addEventListener('online', () => {
-    console.log('[sync] Browser online event fired')
-    tryReconnectExistingSession()
+    console.log('[sync] Browser online event fired — forcing reconnect & sync')
+    tryReconnectExistingSession(true)
   })
 }
 
@@ -188,6 +203,19 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument) {
           console.log(`[sync] Applying ${opsToApply.length} remote ops to doc`)
           currentDoc.applyRemote(opsToApply)
           useStore.getState().incDocVersion()
+
+          // If any ops are still stuck in outOfOrderBuffer (e.g. we missed earlier ops while briefly offline),
+          // request a catchup from the server by sending our current knownVersions.
+          if (currentDoc.outOfOrderBuffer.size > 0 && store.user?.token) {
+            console.log(`[sync] ${currentDoc.outOfOrderBuffer.size} ops in outOfOrderBuffer — requesting catchup`)
+            sendMsg({
+              type: 'join',
+              docId,
+              agentId,
+              knownVersions: getVersionMap(currentDoc.oplog),
+              token: store.user.token
+            })
+          }
         }
         break
       }
@@ -215,7 +243,9 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument) {
     if (ws !== socket) return
     store.setStatus('offline')
     if (reconnectTimeout) clearTimeout(reconnectTimeout)
-    reconnectTimeout = setTimeout(() => connectWs(docId, agentId, doc), 3000) // Reconnect loop
+    if (typeof navigator === 'undefined' || navigator.onLine) {
+      reconnectTimeout = setTimeout(() => connectWs(docId, agentId, doc), 3000) // Reconnect loop
+    }
   }
 
   socket.onerror = () => {
@@ -269,20 +299,29 @@ export async function broadcastOps(ops: WireOp[]) {
   const docId = store.docId
   if (!docId) return
   
-  console.log(`[sync] Broadcasting ${ops.length} ops, wsState=${ws?.readyState}`)
+  const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine
+  console.log(`[sync] Broadcasting ${ops.length} ops, wsState=${ws?.readyState}, online=${isOnline}`)
   
   // 1. Optimistically save to IDB in case we're offline
   await saveOfflineOps(docId, ops)
   
-  // 2. Send over WS
-  if (ws?.readyState === WebSocket.OPEN) {
+  // 2. Send over WS (include any earlier un-ACKed ops from IDB so sequence gaps never happen)
+  if (isOnline && ws?.readyState === WebSocket.OPEN) {
+    const offlineRecs = await getOfflineOps(docId)
+    const pendingOps = offlineRecs.length > 0 ? offlineRecs.map(r => r.op) : ops
     sendMsg({
       type: 'ops',
       docId,
-      ops
+      ops: pendingOps
     })
   } else {
-    console.warn(`[sync] WS not open (state=${ws?.readyState}), ops saved to IDB only`)
+    if (!isOnline && ws) {
+      ws.onclose = null
+      ws.close()
+      ws = null
+      store.setStatus('offline')
+    }
+    console.warn(`[sync] Offline or WS not open (state=${ws?.readyState}, online=${isOnline}), ops saved to IDB only`)
     // Request Background Sync if supported
     if ('serviceWorker' in navigator && 'SyncManager' in window) {
       try {

@@ -245,17 +245,21 @@ export function registerWsHandler(app: FastifyInstance, db: DB, sql: any): void 
         if (currentDocId && currentAgentId) {
           const session = app.sessions?.get(currentDocId)
           if (session) {
-            removePeer(session, currentAgentId)
-            // Notify remaining peers.
-            broadcast(
-              session,
-              JSON.stringify({
-                type: 'peers',
-                docId: currentDocId,
-                peers: getPeersInfo(session),
-              } satisfies ServerMessage),
-            )
-            publishEvent(currentDocId, { type: 'sync_peers', peers: getLocalPeersInfo(session) })
+            const existing = session.peers.get(currentAgentId)
+            // Only remove if this closing socket is still the active socket for this agentId!
+            if (existing && existing.ws === socket) {
+              removePeer(session, currentAgentId)
+              // Notify remaining peers.
+              broadcast(
+                session,
+                JSON.stringify({
+                  type: 'peers',
+                  docId: currentDocId,
+                  peers: getPeersInfo(session),
+                } satisfies ServerMessage),
+              )
+              publishEvent(currentDocId, { type: 'sync_peers', peers: getLocalPeersInfo(session) })
+            }
           }
         }
       })
@@ -311,9 +315,17 @@ async function handleJoin(
     return
   }
 
+  const prevPeer = session.peers.get(agentId)
+  if (prevPeer && prevPeer.ws !== socket) {
+    color = prevPeer.color
+    try {
+      prevPeer.ws.close()
+    } catch {
+      // ignore
+    }
+  }
+
   const peer: ConnectedPeer = { ws: socket, agentId, userId, name, picture, color, lastSeen: Date.now() }
-
-
 
   addPeer(session, peer)
   onJoined(docId, agentId)

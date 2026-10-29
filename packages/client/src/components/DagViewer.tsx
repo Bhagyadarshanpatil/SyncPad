@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import ReactFlow, { Background, Controls, MarkerType, Handle, Position, NodeProps } from 'reactflow'
 import 'reactflow/dist/style.css'
+import { advanceFrontier } from '@syncpad/egwalker-core'
 import { useStore } from '../store'
 
 // Custom node for conflicts (amber diamond)
@@ -112,11 +113,12 @@ export function DagViewer() {
         }
       }
 
+      const maxLv = Math.max(0, doc.oplog.ops.length - 1)
       setNodes(newNodes)
       setEdges(newEdges)
-      setMaxSlider(doc.oplog.ops.length - 1)
+      setMaxSlider(maxLv)
       if (timeTravelFrontier === null) {
-        setSliderValue(doc.oplog.ops.length - 1)
+        setSliderValue(maxLv)
       }
     }, 300) // 300ms debounce
     return () => clearTimeout(timer)
@@ -147,13 +149,18 @@ export function DagViewer() {
   }, [])
   
   const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!doc) return
+    if (!doc || doc.oplog.ops.length === 0) return
     const val = parseInt(e.target.value)
+    const maxLv = Math.max(0, doc.oplog.ops.length - 1)
     setSliderValue(val)
-    if (val === maxSlider) {
+    if (val >= maxLv) {
       setTimeTravelFrontier(null)
     } else {
-      setTimeTravelFrontier([val])
+      let frontier: number[] = []
+      for (let i = 0; i <= val && i < doc.oplog.ops.length; i++) {
+        frontier = advanceFrontier(frontier, i, doc.oplog.ops[i].parents)
+      }
+      setTimeTravelFrontier(frontier)
     }
   }
 
@@ -168,9 +175,18 @@ export function DagViewer() {
             min="0" 
             max={maxSlider} 
             value={sliderValue}
+            disabled={!doc || doc.oplog.ops.length === 0}
             onChange={handleSliderChange}
             className="w-32"
           />
+          {timeTravelFrontier !== null && (
+            <button
+              onClick={() => setTimeTravelFrontier(null)}
+              className="px-2 py-0.5 bg-blue-600 text-white rounded text-[10px] hover:bg-blue-700"
+            >
+              Live
+            </button>
+          )}
         </div>
         <span>{nodes.length} ops</span>
       </div>
