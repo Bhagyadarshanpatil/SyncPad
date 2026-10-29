@@ -95,25 +95,20 @@ export function checkoutFancy(
     placeholders: new Map(),
   }
 
-  // Build a SINGLE placeholder item for all ops in the existing branch snapshot.
-  // This turns O(N) object allocation into O(1).
   const placeholderLength = branch.frontier.length > 0
     ? Math.max(...branch.frontier) + 1
     : 0
 
-  if (placeholderLength > 0) {
-    const ph: PlaceholderItem = {
-      isPlaceholder: true,
-      lv: 0 + 1e12, // startPos + 1e12
-      startPos: 0,
-      endPos: placeholderLength,
+  for (let i = 0; i < placeholderLength; i++) {
+    const item = {
+      lv: i + 1e12,
       curState: INSERTED,
       deleted: false,
-      originLeft: -1,
-      originRight: -1,
+      originLeft: -1 as const,
+      originRight: -1 as const,
     }
-    doc.items.push(ph)
-    doc.placeholders!.set(ph.lv, ph)
+    doc.items.push(item)
+    doc.itemsByLV[item.lv] = item
   }
 
   // Phase 1: replay shared ops (adjust CRDT positions, no snapshot mutation).

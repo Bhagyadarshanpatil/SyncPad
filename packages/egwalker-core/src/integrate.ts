@@ -26,7 +26,7 @@ export function isPlaceholder(item: DocItem): item is PlaceholderItem {
 export function retreat(doc: CRDTDoc, oplog: OpLog, opLv: LV): void {
   const op = oplog.ops[opLv]
   const targetLV = op.type === 'ins' ? opLv : doc.delTargets[opLv]
-  const item = targetLV >= 1e12 ? doc.placeholders!.get(targetLV)! : doc.itemsByLV[targetLV]
+  const item = doc.itemsByLV[targetLV] ?? doc.placeholders!.get(targetLV)!
   item.curState--
 }
 
@@ -38,7 +38,7 @@ export function retreat(doc: CRDTDoc, oplog: OpLog, opLv: LV): void {
 export function advance(doc: CRDTDoc, oplog: OpLog, opLv: LV): void {
   const op = oplog.ops[opLv]
   const targetLV = op.type === 'ins' ? opLv : doc.delTargets[opLv]
-  const item = targetLV >= 1e12 ? doc.placeholders!.get(targetLV)! : doc.itemsByLV[targetLV]
+  const item = doc.itemsByLV[targetLV] ?? doc.placeholders!.get(targetLV)!
   item.curState++
 }
 

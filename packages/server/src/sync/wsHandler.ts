@@ -183,57 +183,61 @@ export function registerWsHandler(app: FastifyInstance, db: DB, sql: any): void 
       // Each connection starts un-joined; we track state here.
       let currentDocId: string | null = null
       let currentAgentId: string | null = null
+      let messageQueue = Promise.resolve()
 
-      // ── Message dispatch ────────────────────────────────────────────────────
-      socket.on('message', async (rawMsg: Buffer) => {
-        const msg = parseMessage(rawMsg.toString('utf-8'))
-        if (!msg) {
-          send(socket, { type: 'error', message: 'Invalid JSON' })
-          return
-        }
-
-        try {
-          switch (msg.type) {
-            case 'join':
-              console.log(`[ws] JOIN docId=${msg.docId} agentId=${msg.agentId}`)
-              await handleJoin(socket, db, msg, (docId, agentId) => {
-                currentDocId = docId
-                currentAgentId = agentId
-              })
-              break
-
-            case 'ops':
-            case 'catchup':
-              if (!currentDocId || !currentAgentId) {
-                console.warn(`[ws] ${msg.type.toUpperCase()} received before join`)
-                send(socket, { type: 'error', message: 'Not joined to a document' })
-                return
-              }
-              
-              let opsToProcess: WireOp[] = []
-              if ('encoding' in msg && msg.encoding === 'binary' && msg.payload) {
-                const buffer = fromBase64(msg.payload)
-                opsToProcess = decodeOpLog(buffer)
-                console.log(`[ws] CATCHUP (binary) docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
-              } else if ('ops' in msg && msg.ops) {
-                opsToProcess = msg.ops
-                console.log(`[ws] ${msg.type.toUpperCase()} docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
-              }
-              
-              if (opsToProcess.length > 0) {
-                await handleOps(socket, db, msg.docId, opsToProcess, currentAgentId)
-              }
-              break
-
-            case 'ping':
-              if (!currentDocId || !currentAgentId) return
-              handlePing(currentDocId, currentAgentId, msg)
-              break
+      // ── Message dispatch (serialized per socket) ────────────────────────────
+      socket.on('message', (rawMsg: Buffer) => {
+        messageQueue = messageQueue.then(async () => {
+          const msg = parseMessage(rawMsg.toString('utf-8'))
+          if (!msg) {
+            send(socket, { type: 'error', message: 'Invalid JSON' })
+            return
           }
-        } catch (err) {
-          console.error('[ws] Error handling message:', err)
-          send(socket, { type: 'error', message: 'Internal server error' })
-        }
+
+          try {
+            switch (msg.type) {
+              case 'join':
+                console.log(`[ws] JOIN docId=${msg.docId} agentId=${msg.agentId}`)
+                await handleJoin(socket, db, msg, (docId, agentId) => {
+                  currentDocId = docId
+                  currentAgentId = agentId
+                })
+                break
+
+              case 'ops':
+              case 'catchup': {
+                if (!currentDocId || !currentAgentId) {
+                  console.warn(`[ws] ${msg.type.toUpperCase()} received before join`)
+                  send(socket, { type: 'error', message: 'Not joined to a document' })
+                  return
+                }
+                
+                let opsToProcess: WireOp[] = []
+                if ('encoding' in msg && msg.encoding === 'binary' && msg.payload) {
+                  const buffer = fromBase64(msg.payload)
+                  opsToProcess = decodeOpLog(buffer)
+                  console.log(`[ws] CATCHUP (binary) docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
+                } else if ('ops' in msg && msg.ops) {
+                  opsToProcess = msg.ops
+                  console.log(`[ws] ${msg.type.toUpperCase()} docId=${msg.docId} ops=${opsToProcess.length} from=${currentAgentId}`)
+                }
+                
+                if (opsToProcess.length > 0) {
+                  await handleOps(socket, db, msg.docId, opsToProcess, currentAgentId)
+                }
+                break
+              }
+
+              case 'ping':
+                if (!currentDocId || !currentAgentId) return
+                handlePing(currentDocId, currentAgentId, msg)
+                break
+            }
+          } catch (err) {
+            console.error('[ws] Error handling message:', err)
+            send(socket, { type: 'error', message: 'Internal server error' })
+          }
+        })
       })
 
       // ── Cleanup on disconnect ───────────────────────────────────────────────
@@ -314,8 +318,8 @@ async function handleJoin(
   addPeer(session, peer)
   onJoined(docId, agentId)
 
-  // Send catch-up ops the client is missing.
-  const catchupOps = await getCatchupOps(db, docId, knownVersions)
+  // Send catch-up ops the client is missing (from the authoritative in-memory doc).
+  const catchupOps = session.doc.getMissingFor(knownVersions)
   if (catchupOps.length > 0) {
     const encoded = encodeWireOps(catchupOps)
     send(socket, {
@@ -350,12 +354,19 @@ async function handleOps(
 
   const { newOps } = await applyRemoteOps(db, session, wireOps)
 
-  // ACK to sender.
-  send(socket, {
-    type: 'ack',
-    docId,
-    opIds: newOps.map(op => [op.agentId, op.seq]),
-  })
+  // ACK all incoming ops that are now integrated in the server's oplog
+  // (including duplicates that were already applied).
+  const ackedOpIds = wireOps
+    .filter(op => (session.doc.oplog.version[op.agentId] ?? -1) >= op.seq)
+    .map(op => [op.agentId, op.seq] as [string, number])
+
+  if (ackedOpIds.length > 0) {
+    send(socket, {
+      type: 'ack',
+      docId,
+      opIds: ackedOpIds,
+    })
+  }
 
   // Broadcast to all other clients.
   if (newOps.length > 0) {

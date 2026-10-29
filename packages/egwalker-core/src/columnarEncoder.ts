@@ -113,13 +113,32 @@ export function encodeWireOps(wireOps: WireOp[]): EncodedOpLog {
     topoIdx.set(`${sorted[i].agentId}:${sorted[i].seq}`, i)
   }
 
+  // External parents (parents not present in this batch, e.g. during partial catch-up).
+  const externalParents: [string, number][] = []
+  const externalParentIdx = new Map<string, number>()
+
+  function getEncodedParentRef(agentId: string, seq: number): number {
+    const key = `${agentId}:${seq}`
+    const internalIdx = topoIdx.get(key)
+    if (internalIdx !== undefined) {
+      return internalIdx * 2 // even: internal index in sorted[]
+    }
+    let extIdx = externalParentIdx.get(key)
+    if (extIdx === undefined) {
+      extIdx = externalParents.length
+      externalParents.push([agentId, seq])
+      externalParentIdx.set(key, extIdx)
+    }
+    return extIdx * 2 + 1 // odd: index in externalParents[]
+  }
+
   // ── Metadata column ──────────────────────────────────────────────────────
   // Per op: [type:1bit | pos:varint | runLength:varint | agentIdLen:varint | agentId:utf8 | seq:varint]
   const metaBuf: number[] = []
   // ── Content column (raw chars, to be LZ4-compressed) ────────────────────
   let contentStr = ''
   // ── Topology column (exceptions to "parent = predecessor") ──────────────
-  const topoExceptions: Array<{ opIdx: number; parentIdxs: number[] }> = []
+  const topoExceptions: Array<{ opIdx: number; parentRefs: number[] }> = []
 
   for (let i = 0; i < sorted.length; i++) {
     const op = sorted[i]
@@ -157,22 +176,33 @@ export function encodeWireOps(wireOps: WireOp[]): EncodedOpLog {
     if (!isDefault) {
       topoExceptions.push({
         opIdx: i,
-        parentIdxs: op.parentIds.map(([a, s]) => topoIdx.get(`${a}:${s}`) ?? -1),
+        parentRefs: op.parentIds.map(([a, s]) => getEncodedParentRef(a, s)),
       })
     }
   }
 
   // ── LZ4 compression for content ──────────────────────────────────────────
   const uncompressedContent = new TextEncoder().encode(contentStr)
-  const contentBytes = compress(uncompressedContent)
+  const contentBytes = uncompressedContent.length > 0
+    ? compress(uncompressedContent)
+    : new Uint8Array(0)
 
   // ── Topology column serialisation ─────────────────────────────────────────
   const topoBuf: number[] = []
   writeVarint(topoBuf, topoExceptions.length)
   for (const ex of topoExceptions) {
     writeVarint(topoBuf, ex.opIdx)
-    writeVarint(topoBuf, ex.parentIdxs.length)
-    for (const pi of ex.parentIdxs) writeVarint(topoBuf, pi < 0 ? 0xffffffff : pi)
+    writeVarint(topoBuf, ex.parentRefs.length)
+    for (const ref of ex.parentRefs) writeVarint(topoBuf, ref)
+  }
+
+  // External parents table.
+  writeVarint(topoBuf, externalParents.length)
+  for (const [agentId, seq] of externalParents) {
+    const agentBytes = new TextEncoder().encode(agentId)
+    writeVarint(topoBuf, agentBytes.length)
+    for (const b of agentBytes) topoBuf.push(b)
+    writeVarint(topoBuf, seq)
   }
 
   // ── Assemble header + columns ─────────────────────────────────────────────
@@ -225,7 +255,7 @@ export function decodeOpLog(buffer: Uint8Array): WireOp[] {
 
     let r = readVarint(buffer, off); const pos = r.value; off = r.offset
     r = readVarint(buffer, off); const runLength = r.value; off = r.offset
-    r = readVarint(buffer, off); const agentIdLen = r.value; off = r.offset
+    r = readVarint(buffer, off); const agentIdLen = r.value; off = trAgentLen(r.offset)
 
     const agentId = new TextDecoder().decode(buffer.slice(off, off + agentIdLen))
     off += agentIdLen
@@ -235,11 +265,16 @@ export function decodeOpLog(buffer: Uint8Array): WireOp[] {
     metaOps.push({ type, pos, runLength, agentId, seq })
   }
 
+  function trAgentLen(o: number) { return o }
+
   // Decode content column.
-  const compressedContent = buffer.slice(off, off + contentByteLen)
-  const decompressedContent = decompress(compressedContent)
-  const contentStr = new TextDecoder().decode(decompressedContent)
-  off += contentByteLen
+  let contentStr = ''
+  if (contentByteLen > 0) {
+    const compressedContent = buffer.slice(off, off + contentByteLen)
+    const decompressedContent = decompress(compressedContent)
+    contentStr = new TextDecoder().decode(decompressedContent)
+    off += contentByteLen
+  }
   const contentChars = [...contentStr]
 
   // Decode topology column.
@@ -255,6 +290,19 @@ export function decodeOpLog(buffer: Uint8Array): WireOp[] {
     exceptions.set(opIdx, parents)
   }
 
+  // Decode external parents table (if present).
+  const externalParents: [string, number][] = []
+  if (off < buffer.byteLength) {
+    tr = readVarint(buffer, off); const numExternal = tr.value; off = tr.offset
+    for (let i = 0; i < numExternal; i++) {
+      tr = readVarint(buffer, off); const agentIdLen = tr.value; off = tr.offset
+      const agentId = new TextDecoder().decode(buffer.slice(off, off + agentIdLen))
+      off += agentIdLen
+      tr = readVarint(buffer, off); const seq = tr.value; off = tr.offset
+      externalParents.push([agentId, seq])
+    }
+  }
+
   // Reconstruct WireOps.
   const wireOps: WireOp[] = []
   let contentIdx = 0
@@ -263,18 +311,21 @@ export function decodeOpLog(buffer: Uint8Array): WireOp[] {
     const m = metaOps[i]
 
     // Default parent is the predecessor op.
-    let parentIdxs: number[]
+    let parentIds: [string, number][]
     if (exceptions.has(i)) {
-      parentIdxs = exceptions.get(i)!
+      const parentRefs = exceptions.get(i)!
+      parentIds = parentRefs.map(ref => {
+        if ((ref & 1) === 1) {
+          return externalParents[ref >>> 1]
+        }
+        const pi = ref >>> 1
+        return [metaOps[pi].agentId, metaOps[pi].seq] as [string, number]
+      })
     } else if (i === 0) {
-      parentIdxs = []
+      parentIds = []
     } else {
-      parentIdxs = [i - 1]
+      parentIds = [[metaOps[i - 1].agentId, metaOps[i - 1].seq]]
     }
-
-    const parentIds: [string, number][] = parentIdxs
-      .filter(pi => pi !== 0xffffffff)
-      .map(pi => [metaOps[pi].agentId, metaOps[pi].seq])
 
     const wire: WireOp = {
       agentId: m.agentId,

@@ -109,30 +109,10 @@ type MergePoint = { v: LV[]; isInA: boolean }
  * that both A and B already share.
  */
 export function findOpsToVisit(oplog: OpLog, a: LV[], b: LV[]): OpsToVisit {
-  // Special case: if A is the empty frontier (fresh / empty branch), every op
-  // reachable from B is a genuinely new op — no shared ancestry to compute.
-  if (a.length === 0) {
-    const bOnlyOps: LV[] = []
-    const visited = new Set<LV>()
-    const stack = [...b]
-    while (stack.length > 0) {
-      const lv = stack.pop()!
-      if (visited.has(lv)) continue
-      visited.add(lv)
-      bOnlyOps.push(lv)
-      for (const p of oplog.ops[lv].parents) {
-        if (!visited.has(p)) stack.push(p)
-      }
-    }
-    bOnlyOps.sort((x, y) => x - y) // ascending — apply oldest first
-    return { commonVersion: [], sharedOps: [], bOnlyOps }
-  }
-
   // Priority queue: process highest LV arrays first (descending).
   const queue: MergePoint[] = []
 
   function enq(v: LV[], isInA: boolean) {
-    if (v.length === 0) return  // Empty frontier — nothing to enqueue.
     const mp: MergePoint = { v: v.slice().sort((x, y) => y - x), isInA }
     // Insert in order: highest v first.
     let i = queue.length
@@ -149,6 +129,11 @@ export function findOpsToVisit(oplog: OpLog, a: LV[], b: LV[]): OpsToVisit {
 
   while (queue.length > 0) {
     let { v, isInA } = queue.shift()!
+    if (v.length === 0) {
+      // We've hit the root element.
+      commonVersion = []
+      break
+    }
 
     // Consume all items at the same version.
     while (queue.length > 0 && compareArrays(queue[0].v, v) === 0) {

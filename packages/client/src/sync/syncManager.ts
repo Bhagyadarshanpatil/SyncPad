@@ -17,7 +17,11 @@ import {
 
 // Helper to convert Uint8Array to base64
 function toBase64(arr: Uint8Array): string {
-  return btoa(String.fromCharCode.apply(null, arr as any))
+  let binary = ''
+  for (let i = 0; i < arr.length; i++) {
+    binary += String.fromCharCode(arr[i])
+  }
+  return btoa(binary)
 }
 
 // Helper to convert base64 to Uint8Array
@@ -32,19 +36,38 @@ function fromBase64(b64: string): Uint8Array {
 
 let ws: WebSocket | null = null
 let pingInterval: ReturnType<typeof setInterval>
+let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
 let isInitializing = false
+
+function tryReconnectExistingSession() {
+  const store = useStore.getState()
+  if (
+    store.docId &&
+    store.agentId &&
+    store.doc &&
+    (!ws || (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING))
+  ) {
+    console.log('[sync] Reconnecting existing session')
+    if (reconnectTimeout) {
+      clearTimeout(reconnectTimeout)
+      reconnectTimeout = null
+    }
+    connectWs(store.docId, store.agentId, store.doc)
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    console.log('[sync] Browser online event fired')
+    tryReconnectExistingSession()
+  })
+}
 
 if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (event) => {
     if (event.data?.type === 'trigger-sync') {
       console.log('[sync] Received trigger-sync from SW')
-      const store = useStore.getState()
-      if (store.docId && (!ws || ws.readyState === WebSocket.CLOSED)) {
-        console.log('[sync] Reconnecting due to background sync event')
-        // Close old and re-init to pull offline ops and connect
-        closeSync()
-        initSync(store.docId)
-      }
+      tryReconnectExistingSession()
     }
   })
 }
@@ -80,11 +103,21 @@ export async function initSync(docId: string): Promise<void> {
   }
 
   // 3. Connect WebSocket
-  connectWs(docId, agentId, doc, offlineOps)
+  connectWs(docId, agentId, doc)
   isInitializing = false
 }
 
-function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOfflineOps: WireOp[]) {
+function connectWs(docId: string, agentId: string, doc: CRDTDocument) {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout)
+    reconnectTimeout = null
+  }
+  if (ws) {
+    ws.onclose = null
+    ws.close()
+    ws = null
+  }
+
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   
   // Use VITE_WS_URL if provided (e.g. for production Cloud Run direct connection)
@@ -95,10 +128,12 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
       ? `ws://localhost:3001/ws` 
       : `${protocol}//${window.location.host}/ws`
 
-  ws = new WebSocket(wsUrl)
+  const socket = new WebSocket(wsUrl)
+  ws = socket
   const store = useStore.getState()
 
-  ws.onopen = () => {
+  socket.onopen = async () => {
+    if (ws !== socket) return
     store.setStatus('connected')
     console.log(`[sync] Connected! agentId=${agentId} docId=${docId}`)
     
@@ -113,8 +148,10 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
       token: store.user?.token
     })
 
-    // If we have pending offline ops, send them as catchup
-    if (pendingOfflineOps.length > 0) {
+    // Query IndexedDB for any un-ACKed offline ops and send them as catchup
+    const offlineRecs = await getOfflineOps(docId)
+    const pendingOfflineOps = offlineRecs.map(r => r.op)
+    if (ws === socket && socket.readyState === WebSocket.OPEN && pendingOfflineOps.length > 0) {
       console.log(`[sync] Sending CATCHUP with ${pendingOfflineOps.length} offline ops`)
       const encoded = encodeWireOps(pendingOfflineOps)
       sendMsg({
@@ -126,7 +163,7 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
     }
   }
 
-  ws.onmessage = async (e) => {
+  socket.onmessage = async (e) => {
     const msg = JSON.parse(e.data) as ServerMessage
     console.log(`[sync] Received:`, msg.type, msg)
     
@@ -175,12 +212,14 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
     }
   }
 
-  ws.onclose = () => {
+  socket.onclose = () => {
+    if (ws !== socket) return
     store.setStatus('offline')
-    setTimeout(() => connectWs(docId, agentId, doc, []), 3000) // Reconnect loop
+    if (reconnectTimeout) clearTimeout(reconnectTimeout)
+    reconnectTimeout = setTimeout(() => connectWs(docId, agentId, doc), 3000) // Reconnect loop
   }
 
-  ws.onerror = () => {
+  socket.onerror = () => {
     // onclose will handle reconnect
   }
 
@@ -205,6 +244,10 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument, pendingOff
 
 export function closeSync() {
   isInitializing = false  // Allow re-init after close
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout)
+    reconnectTimeout = null
+  }
   if (ws) {
     ws.onclose = null // Prevent reconnect loop
     ws.close()
