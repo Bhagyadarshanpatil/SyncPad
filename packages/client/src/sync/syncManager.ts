@@ -37,7 +37,7 @@ function fromBase64(b64: string): Uint8Array {
 let ws: WebSocket | null = null
 let pingInterval: ReturnType<typeof setInterval>
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null
-let isInitializing = false
+let syncSessionId = 0
 
 function tryReconnectExistingSession() {
   const store = useStore.getState()
@@ -73,14 +73,9 @@ if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
 }
 
 export async function initSync(docId: string): Promise<void> {
-  // Guard: if already initializing (React StrictMode double-invoke), skip.
-  if (isInitializing) {
-    console.log('[sync] initSync already in progress, skipping duplicate call')
-    return
-  }
-  isInitializing = true
-
+  const mySessionId = ++syncSessionId
   const store = useStore.getState()
+  store.setStatus('connecting')
   
   // 1. Setup identity and Doc
   // We ALWAYS generate a fresh replica ID (agentId) on load.
@@ -95,6 +90,11 @@ export async function initSync(docId: string): Promise<void> {
 
   // 2. Load offline ops from IDB (all unsynced ops for this document)
   const offlineRecs = await getOfflineOps(docId)
+  if (mySessionId !== syncSessionId) {
+    // Cancelled by closeSync() or superseded by a newer initSync() (e.g. React StrictMode)
+    return
+  }
+
   const offlineOps = offlineRecs.map(r => r.op)
   if (offlineOps.length > 0) {
     console.log(`[sync] Loaded ${offlineOps.length} offline ops from IDB`)
@@ -104,7 +104,6 @@ export async function initSync(docId: string): Promise<void> {
 
   // 3. Connect WebSocket
   connectWs(docId, agentId, doc)
-  isInitializing = false
 }
 
 function connectWs(docId: string, agentId: string, doc: CRDTDocument) {
@@ -243,7 +242,7 @@ function connectWs(docId: string, agentId: string, doc: CRDTDocument) {
 }
 
 export function closeSync() {
-  isInitializing = false  // Allow re-init after close
+  syncSessionId++ // Invalidate any in-flight initSync
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout)
     reconnectTimeout = null

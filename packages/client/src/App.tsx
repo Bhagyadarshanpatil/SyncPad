@@ -38,7 +38,7 @@ function App() {
     // Listen for hash changes to join new rooms
     const handleHashChange = () => {
       const newId = window.location.hash.slice(1)
-      if (newId) {
+      if (newId && newId !== useStore.getState().docId) {
         closeSync()
         initSync(newId)
       }
