@@ -30,20 +30,24 @@ async function main() {
   const connectionString = process.env.DATABASE_URL
   if (!connectionString) throw new Error('DATABASE_URL is not set')
 
-  // Support Cloud SQL unix sockets via ?host=/cloudsql/... in the URL.
-  // IMPORTANT: we must strip the ?host= param from the URL string before
-  // passing it to postgres.js — otherwise postgres.js forwards unknown query
-  // params as `SET host = ...` session commands, which PostgreSQL rejects
-  // with error 42704 ("unrecognized configuration parameter").
+  // Support Cloud SQL unix sockets (?host=/cloudsql/...) as well as
+  // Supabase / Neon connection strings (?pgbouncer=true, ?sslmode=require, etc.).
+  // IMPORTANT: postgres.js forwards unknown URL query params as `SET <param> = ...`
+  // session commands, which PostgreSQL rejects with error 42704.
   let hostOverride: string | undefined = undefined
   let cleanedConnectionString = connectionString
+  let isLocalhost = false
   try {
     const url = new URL(connectionString)
+    isLocalhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1'
     if (url.searchParams.has('host')) {
       hostOverride = url.searchParams.get('host') || undefined
-      url.searchParams.delete('host') // Remove so postgres.js doesn't treat it as a SET param
-      cleanedConnectionString = url.toString()
     }
+    // Strip query parameters that postgres.js might misinterpret as PG GUC settings
+    for (const key of [...url.searchParams.keys()]) {
+      url.searchParams.delete(key)
+    }
+    cleanedConnectionString = url.toString()
   } catch (e) {
     // Ignore URL parse errors, let postgres.js handle it
   }
@@ -51,6 +55,8 @@ async function main() {
   const sql = postgres(cleanedConnectionString, {
     max: 10,
     connect_timeout: 10,
+    prepare: false, // Required for Supabase connection pooler (Supavisor)
+    ...(!isLocalhost && !hostOverride ? { ssl: 'require' } : {}),
     ...(hostOverride ? { host: hostOverride } : {})
   })
   
